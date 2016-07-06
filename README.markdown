@@ -95,6 +95,12 @@ Sessions have a lifetime expressed in seconds and stored in the INI variable "se
 The session handler requires a version of Redis with the `SETEX` command (at least 2.0).
 phpredis can also connect to a unix domain socket: `session.save_path = "unix:///var/run/redis/redis.sock?persistent=1&weight=1&database=0`.
 
+## DynomiteDB Support (Purpose of this fork!)
+Mew session save handler for [dynomitedb](http://www.dynomitedb.com/). Its possible to define one datacenter rack, and their tokens
+~~~
+session.save_handler = dynomite
+session.save_path = "tcp://host1:8102?tokens=0, tcp://host2:8102?tokens=2147483647"
+~~~
 
 ## Building on Windows
 
