@@ -4,6 +4,7 @@ require_once(dirname($_SERVER['PHP_SELF'])."/TestSuite.php");
 require_once(dirname($_SERVER['PHP_SELF'])."/RedisTest.php");
 require_once(dirname($_SERVER['PHP_SELF'])."/RedisArrayTest.php");
 require_once(dirname($_SERVER['PHP_SELF'])."/RedisClusterTest.php");
+require_once(dirname($_SERVER['PHP_SELF'])."/SessionTest.php");
 
 /* Make sure errors go to stdout and are shown */
 error_reporting(E_ALL);
@@ -13,7 +14,7 @@ ini_set( 'display_errors','1');
 $arr_args = getopt('', Array('host:', 'class:', 'test:', 'nocolors'));
 
 /* Grab the test the user is trying to run */
-$arr_valid_classes = Array('redis', 'redisarray', 'rediscluster');
+$arr_valid_classes = Array('redis', 'redisarray', 'rediscluster','session');
 $str_class = isset($arr_args['class']) ? strtolower($arr_args['class']) : 'redis';
 $boo_colorize = !isset($arr_args['nocolors']);
 
@@ -29,6 +30,7 @@ if (!in_array($str_class, $arr_valid_classes)) {
     exit(1);
 }
 
+if ($str_class == 'session') session_start();
 /* Toggle colorization in our TestSuite class */
 TestSuite::flagColorization($boo_colorize);
 
@@ -52,8 +54,11 @@ if ($str_class == 'redis') {
         run_tests('Redis_Multi_Exec_Test', $str_filter, $str_host);
         run_tests('Redis_Distributor_Test', $str_filter, $str_host);
     }
-} else {
+} else if ($str_class == 'rediscluster'){
     echo TestSuite::make_bold("RedisCluster") . "\n";
     exit(TestSuite::run("Redis_Cluster_Test", $str_filter, $str_host));
+} else {
+    echo TestSuite::make_bold("RedisSession") . "\n";
+    exit(TestSuite::run("Redis_Session", $str_filter, $str_host));
 }
 ?>

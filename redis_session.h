@@ -17,6 +17,13 @@ PS_WRITE_FUNC(rediscluster);
 PS_DESTROY_FUNC(rediscluster);
 PS_GC_FUNC(rediscluster);
 
+PS_OPEN_FUNC(dynomite);
+PS_CLOSE_FUNC(dynomite);
+PS_READ_FUNC(dynomite);
+PS_WRITE_FUNC(dynomite);
+PS_DESTROY_FUNC(dynomite);
+PS_GC_FUNC(dynomite);
+
 #endif
 #endif
 
