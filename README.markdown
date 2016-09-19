@@ -96,11 +96,12 @@ The session handler requires a version of Redis with the `SETEX` command (at lea
 phpredis can also connect to a unix domain socket: `session.save_path = "unix:///var/run/redis/redis.sock?persistent=1&weight=1&database=0`.
 
 ## DynomiteDB Support (Purpose of this fork!)
-Mew session save handler for [dynomitedb](http://www.dynomitedb.com/). Its possible to define one datacenter rack, and their tokens
+New session save handler for [dynomitedb](http://www.dynomitedb.com/). It's possible to define one datacenter rack, and their tokens
 ~~~
 session.save_handler = dynomite
 session.save_path = "tcp://host1:8102?tokens=0, tcp://host2:8102?tokens=2147483647"
 ~~~
+Checkout dynomitedb branch.
 
 ## Building on Windows
 
