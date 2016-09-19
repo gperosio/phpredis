@@ -8,7 +8,6 @@
 #include <netinet/tcp.h>  /* TCP_NODELAY */
 #include <sys/socket.h>
 #endif
-#include <ext/standard/php_smart_str.h>
 #include <ext/standard/php_var.h>
 #ifdef HAVE_REDIS_IGBINARY
 #include "igbinary/igbinary.h"
@@ -38,7 +37,6 @@
 
 extern zend_class_entry *redis_ce;
 extern zend_class_entry *redis_exception_ce;
-extern zend_class_entry *spl_ce_RuntimeException;
 
 /* Helper to reselect the proper DB number when we reconnect */
 static int reselect_db(RedisSock *redis_sock TSRMLS_DC) {
@@ -160,11 +158,7 @@ PHP_REDIS_API int redis_check_eof(RedisSock *redis_sock, int no_throw TSRMLS_DC)
         if((MULTI == redis_sock->mode) || redis_sock->watching || count == 10) {
             /* too many failures */
             if(redis_sock->stream) { /* close stream if still here */
-                redis_stream_close(redis_sock TSRMLS_CC);
-                redis_sock->stream = NULL;
-                redis_sock->mode   = ATOMIC;
-                redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-                redis_sock->watching = 0;
+                REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
             }
             if(!no_throw) {
                 zend_throw_exception(redis_exception_ce, "Connection lost", 
@@ -433,11 +427,7 @@ redis_sock_read_multibulk_reply_zval(INTERNAL_FUNCTION_PARAMETERS,
     }
 
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, 
             "read error on connection", 0 TSRMLS_CC);
         return NULL;
@@ -465,18 +455,11 @@ PHP_REDIS_API char *redis_sock_read_bulk_reply(RedisSock *redis_sock, int bytes 
     int offset = 0;
     size_t got;
 
-    char * reply;
+    char *reply, c[2];
 
-    if(-1 == redis_check_eof(redis_sock, 0 TSRMLS_CC)) {
+    if (-1 == bytes || -1 == redis_check_eof(redis_sock, 0 TSRMLS_CC)) {
         return NULL;
     }
-
-    if (bytes == -1) {
-        return NULL;
-    } else {
-        char c;
-        int i;
-
         reply = emalloc(bytes+1);
 
         while(offset < bytes) {
@@ -490,10 +473,7 @@ PHP_REDIS_API char *redis_sock_read_bulk_reply(RedisSock *redis_sock, int bytes 
             }
             offset += got;
         }
-        for(i = 0; i < 2; i++) {
-            php_stream_read(redis_sock->stream, &c, 1);
-        }
-    }
+	php_stream_read(redis_sock->stream, c, 2);
 
     reply[bytes] = 0;
     return reply;
@@ -505,7 +485,6 @@ PHP_REDIS_API char *redis_sock_read_bulk_reply(RedisSock *redis_sock, int bytes 
 PHP_REDIS_API char *redis_sock_read(RedisSock *redis_sock, int *buf_len TSRMLS_DC)
 {
     char inbuf[1024];
-    char *resp = NULL;
     size_t err_len;
 
     if(-1 == redis_check_eof(redis_sock, 0 TSRMLS_CC)) {
@@ -513,11 +492,7 @@ PHP_REDIS_API char *redis_sock_read(RedisSock *redis_sock, int *buf_len TSRMLS_D
     }
 
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, "read error on connection", 
                              0 TSRMLS_CC);
         return NULL;
@@ -539,8 +514,7 @@ PHP_REDIS_API char *redis_sock_read(RedisSock *redis_sock, int *buf_len TSRMLS_D
             return NULL;
         case '$':
             *buf_len = atoi(inbuf + 1);
-            resp = redis_sock_read_bulk_reply(redis_sock, *buf_len TSRMLS_CC);
-            return resp;
+            return redis_sock_read_bulk_reply(redis_sock, *buf_len TSRMLS_CC);
 
         case '*':
             /* For null multi-bulk replies (like timeouts from brpoplpush): */
@@ -555,10 +529,7 @@ PHP_REDIS_API char *redis_sock_read(RedisSock *redis_sock, int *buf_len TSRMLS_D
             /* :123\r\n */
             *buf_len = strlen(inbuf) - 2;
             if(*buf_len >= 2) {
-                resp = emalloc(1+*buf_len);
-                memcpy(resp, inbuf, *buf_len);
-                resp[*buf_len] = 0;
-                return resp;
+                return estrndup(inbuf, *buf_len);
             }
         default:
             zend_throw_exception_ex(
@@ -583,36 +554,38 @@ void add_constant_long(zend_class_entry *ce, char *name, int value) {
 
 int
 integer_length(int i) {
-    int sz = 0;
-    int ci = abs(i);
-    while (ci > 0) {
-        ci /= 10;
+    int sz = 1;
+
+    if (i < 0) { /* allow for neg sign as well. */
+        i = -i;
         sz++;
     }
-    if (i == 0) { /* log 0 doesn't make sense. */
-        sz = 1;
-    } else if (i < 0) { /* allow for neg sign as well. */
-        sz++;
+    for (;;) {
+        if (i < 10) return sz;
+        if (i < 100) return sz + 1;
+        if (i < 1000) return sz + 2;
+        // Skip ahead by 4 orders of magnitude
+        i /= 10000U;
+        sz += 4;
     }
-    return sz;
 }
 
 int
 redis_cmd_format_header(char **ret, char *keyword, int arg_count) {
 	/* Our return buffer */
-	smart_str buf = {0};
+	smart_string buf = {0};
 
 	/* Keyword length */
 	int l = strlen(keyword);
 
-    smart_str_appendc(&buf, '*');
-    smart_str_append_long(&buf, arg_count + 1);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) -1);
-    smart_str_appendc(&buf, '$');
-    smart_str_append_long(&buf, l);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) -1);
-    smart_str_appendl(&buf, keyword, l);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
+    smart_string_appendc(&buf, '*');
+    smart_string_append_long(&buf, arg_count + 1);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) -1);
+    smart_string_appendc(&buf, '$');
+    smart_string_append_long(&buf, l);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) -1);
+    smart_string_appendl(&buf, keyword, l);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
 
 	/* Set our return pointer */
 	*ret = buf.c;
@@ -626,7 +599,7 @@ redis_cmd_format_static(char **ret, char *keyword, char *format, ...)
 {
     char *p = format;
     va_list ap;
-    smart_str buf = {0};
+    smart_string buf = {0};
     int l = strlen(keyword);
     char *dbl_str;
     int dbl_len;
@@ -634,34 +607,34 @@ redis_cmd_format_static(char **ret, char *keyword, char *format, ...)
     va_start(ap, format);
 
     /* add header */
-    smart_str_appendc(&buf, '*');
-    smart_str_append_long(&buf, strlen(format) + 1);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-    smart_str_appendc(&buf, '$');
-    smart_str_append_long(&buf, l);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-    smart_str_appendl(&buf, keyword, l);
-    smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
+    smart_string_appendc(&buf, '*');
+    smart_string_append_long(&buf, strlen(format) + 1);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+    smart_string_appendc(&buf, '$');
+    smart_string_append_long(&buf, l);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+    smart_string_appendl(&buf, keyword, l);
+    smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
 
     while (*p) {
-        smart_str_appendc(&buf, '$');
+        smart_string_appendc(&buf, '$');
 
         switch(*p) {
             case 's': {
                 char *val = va_arg(ap, char*);
                 int val_len = va_arg(ap, int);
-                smart_str_append_long(&buf, val_len);
-                smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-                smart_str_appendl(&buf, val, val_len);
+                smart_string_append_long(&buf, val_len);
+                smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+                smart_string_appendl(&buf, val, val_len);
                 }
                 break;
             case 'f':
             case 'F': {
                 double d = va_arg(ap, double);
                 REDIS_DOUBLE_TO_STRING(dbl_str, dbl_len, d)
-                smart_str_append_long(&buf, dbl_len);
-                smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-                smart_str_appendl(&buf, dbl_str, dbl_len);
+                smart_string_append_long(&buf, dbl_len);
+                smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+                smart_string_appendl(&buf, dbl_str, dbl_len);
                 efree(dbl_str);
             }
                 break;
@@ -671,9 +644,9 @@ redis_cmd_format_static(char **ret, char *keyword, char *format, ...)
                 int i = va_arg(ap, int);
                 char tmp[32];
                 int tmp_len = snprintf(tmp, sizeof(tmp), "%d", i);
-                smart_str_append_long(&buf, tmp_len);
-                smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-                smart_str_appendl(&buf, tmp, tmp_len);
+                smart_string_append_long(&buf, tmp_len);
+                smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+                smart_string_appendl(&buf, tmp, tmp_len);
             }
                 break;
             case 'l':
@@ -681,16 +654,16 @@ redis_cmd_format_static(char **ret, char *keyword, char *format, ...)
                 long l = va_arg(ap, long);
                 char tmp[32];
                 int tmp_len = snprintf(tmp, sizeof(tmp), "%ld", l);
-                smart_str_append_long(&buf, tmp_len);
-                smart_str_appendl(&buf, _NL, sizeof(_NL) -1);
-                smart_str_appendl(&buf, tmp, tmp_len);
+                smart_string_append_long(&buf, tmp_len);
+                smart_string_appendl(&buf, _NL, sizeof(_NL) -1);
+                smart_string_appendl(&buf, tmp, tmp_len);
             }
                 break;
         }
         p++;
-        smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
+        smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
     }
-    smart_str_0(&buf);
+    smart_string_0(&buf);
 
     *ret = buf.c;
 
@@ -706,7 +679,7 @@ redis_cmd_format_static(char **ret, char *keyword, char *format, ...)
 int
 redis_cmd_format(char **ret, char *format, ...) {
 
-    smart_str buf = {0};
+    smart_string buf = {0};
     va_list ap;
     char *p = format;
     char *dbl_str;
@@ -720,7 +693,7 @@ redis_cmd_format(char **ret, char *format, ...) {
                 case 's': {
                     char *tmp = va_arg(ap, char*);
                     int tmp_len = va_arg(ap, int);
-                    smart_str_appendl(&buf, tmp, tmp_len);
+                    smart_string_appendl(&buf, tmp, tmp_len);
                 }
                     break;
 
@@ -728,9 +701,9 @@ redis_cmd_format(char **ret, char *format, ...) {
                 case 'f': {
                     double d = va_arg(ap, double);
                     REDIS_DOUBLE_TO_STRING(dbl_str, dbl_len, d)
-                    smart_str_append_long(&buf, dbl_len);
-                    smart_str_appendl(&buf, _NL, sizeof(_NL) - 1);
-                    smart_str_appendl(&buf, dbl_str, dbl_len);
+                    smart_string_append_long(&buf, dbl_len);
+                    smart_string_appendl(&buf, _NL, sizeof(_NL) - 1);
+                    smart_string_appendl(&buf, dbl_str, dbl_len);
                     efree(dbl_str);
                 }
                     break;
@@ -740,18 +713,18 @@ redis_cmd_format(char **ret, char *format, ...) {
                     int i = va_arg(ap, int);
                     char tmp[32];
                     int tmp_len = snprintf(tmp, sizeof(tmp), "%d", i);
-                    smart_str_appendl(&buf, tmp, tmp_len);
+                    smart_string_appendl(&buf, tmp, tmp_len);
                 }
                     break;
             }
         } else {
-            smart_str_appendc(&buf, *p);
+            smart_string_appendc(&buf, *p);
         }
 
         p++;
     }
 
-    smart_str_0(&buf);
+    smart_string_0(&buf);
 
     *ret = buf.c;
 
@@ -763,17 +736,17 @@ redis_cmd_format(char **ret, char *format, ...) {
  */
 int redis_cmd_append_str(char **cmd, int cmd_len, char *append, int append_len) {
 	/* Smart string buffer */
-	smart_str buf = {0};
+	smart_string buf = {0};
 
-	/* Append the current command to our smart_str */
-	smart_str_appendl(&buf, *cmd, cmd_len);
+	/* Append the current command to our smart_string */
+	smart_string_appendl(&buf, *cmd, cmd_len);
 
 	/* Append our new command sequence */
-	smart_str_appendc(&buf, '$');
-	smart_str_append_long(&buf, append_len);
-	smart_str_appendl(&buf, _NL, sizeof(_NL) -1);
-	smart_str_appendl(&buf, append, append_len);
-	smart_str_appendl(&buf, _NL, sizeof(_NL) -1);
+	smart_string_appendc(&buf, '$');
+	smart_string_append_long(&buf, append_len);
+	smart_string_appendl(&buf, _NL, sizeof(_NL) -1);
+	smart_string_appendl(&buf, append, append_len);
+	smart_string_appendl(&buf, _NL, sizeof(_NL) -1);
 
 	/* Free our old command */
 	efree(*cmd);
@@ -789,27 +762,27 @@ int redis_cmd_append_str(char **cmd, int cmd_len, char *append, int append_len) 
  * Given a smart string, number of arguments, a keyword, and the length of the keyword
  * initialize our smart string with the proper Redis header for the command to follow
  */
-int redis_cmd_init_sstr(smart_str *str, int num_args, char *keyword, int keyword_len) {
-    smart_str_appendc(str, '*');
-    smart_str_append_long(str, num_args + 1);
-    smart_str_appendl(str, _NL, sizeof(_NL) -1);
-    smart_str_appendc(str, '$');
-    smart_str_append_long(str, keyword_len);
-    smart_str_appendl(str, _NL, sizeof(_NL) - 1);
-    smart_str_appendl(str, keyword, keyword_len);
-    smart_str_appendl(str, _NL, sizeof(_NL) - 1);
+int redis_cmd_init_sstr(smart_string *str, int num_args, char *keyword, int keyword_len) {
+    smart_string_appendc(str, '*');
+    smart_string_append_long(str, num_args + 1);
+    smart_string_appendl(str, _NL, sizeof(_NL) -1);
+    smart_string_appendc(str, '$');
+    smart_string_append_long(str, keyword_len);
+    smart_string_appendl(str, _NL, sizeof(_NL) - 1);
+    smart_string_appendl(str, keyword, keyword_len);
+    smart_string_appendl(str, _NL, sizeof(_NL) - 1);
     return str->len;
 }
 
 /*
- * Append a command sequence to a smart_str
+ * Append a command sequence to a smart_string
  */
-int redis_cmd_append_sstr(smart_str *str, char *append, int append_len) {
-    smart_str_appendc(str, '$');
-    smart_str_append_long(str, append_len);
-    smart_str_appendl(str, _NL, sizeof(_NL) - 1);
-    smart_str_appendl(str, append, append_len);
-    smart_str_appendl(str, _NL, sizeof(_NL) - 1);
+int redis_cmd_append_sstr(smart_string *str, char *append, int append_len) {
+    smart_string_appendc(str, '$');
+    smart_string_append_long(str, append_len);
+    smart_string_appendl(str, _NL, sizeof(_NL) - 1);
+    smart_string_appendl(str, append, append_len);
+    smart_string_appendl(str, _NL, sizeof(_NL) - 1);
 
     /* Return our new length */
     return str->len;
@@ -818,7 +791,7 @@ int redis_cmd_append_sstr(smart_str *str, char *append, int append_len) {
 /*
  * Append an integer to a smart string command
  */
-int redis_cmd_append_sstr_int(smart_str *str, int append) {
+int redis_cmd_append_sstr_int(smart_string *str, int append) {
     char int_buf[32];
     int int_len = snprintf(int_buf, sizeof(int_buf), "%d", append);
     return redis_cmd_append_sstr(str, int_buf, int_len);
@@ -827,7 +800,7 @@ int redis_cmd_append_sstr_int(smart_str *str, int append) {
 /*
  * Append a long to a smart string command
  */
-int redis_cmd_append_sstr_long(smart_str *str, long append) {
+int redis_cmd_append_sstr_long(smart_string *str, long append) {
     char long_buf[32];
     int long_len = snprintf(long_buf, sizeof(long_buf), "%ld", append);
     return redis_cmd_append_sstr(str, long_buf, long_len);
@@ -836,7 +809,7 @@ int redis_cmd_append_sstr_long(smart_str *str, long append) {
 /*
  * Append a double to a smart string command
  */
-int redis_cmd_append_sstr_dbl(smart_str *str, double value) {
+int redis_cmd_append_sstr_dbl(smart_string *str, double value) {
     char *dbl_str;
     int dbl_len, retval;
 
@@ -980,6 +953,7 @@ PHP_REDIS_API zval *redis_parse_info_response(char *response) {
         cur = pos + 1;
         pos = strchr(cur, '\r');
         if(pos == NULL) {
+            efree(key);
             break;
         }
         value = emalloc(pos - cur + 1);
@@ -1071,14 +1045,10 @@ PHP_REDIS_API zval* redis_parse_client_list_response(char *response) {
                    have a key and value, but check anyway. */
                 if(kpos && vpos) {
                     /* Allocate, copy in our key */
-                    key = emalloc(klen + 1);
-                    strncpy(key, kpos, klen);
-                    key[klen] = 0;
+                    key = estrndup(kpos, klen);
 
                     /* Allocate, copy in our value */
-                    value = emalloc(p-lpos+1);
-                    strncpy(value,lpos,p-lpos+1);
-                    value[p-lpos]=0;
+                    value = estrndup(lpos, p - lpos);
 
                     /* Treat numbers as numbers, strings as strings */
                     is_numeric = 1;
@@ -1263,39 +1233,39 @@ static void array_zip_values_and_scores(RedisSock *redis_sock, zval *z_tab,
         unsigned int tablekey_len;
         int hkey_len;
         unsigned long idx;
-        zval **z_key_pp, **z_value_pp;
+        zval *z_key_p, *z_value_p;
 
         zend_hash_get_current_key_ex(keytable, &tablekey, &tablekey_len, &idx, 0, NULL);
-        if(zend_hash_get_current_data(keytable, (void**)&z_key_pp) == FAILURE) {
+        if ((z_key_p = zend_hash_get_current_data(keytable)) == NULL) {
             continue;   /* this should never happen, according to the PHP people. */
         }
 
         /* get current value, a key */
-        convert_to_string(*z_key_pp);
-        hkey = Z_STRVAL_PP(z_key_pp);
-        hkey_len = Z_STRLEN_PP(z_key_pp);
+        convert_to_string(z_key_p);
+        hkey = Z_STRVAL_P(z_key_p);
+        hkey_len = Z_STRLEN_P(z_key_p);
 
         /* move forward */
         zend_hash_move_forward(keytable);
 
         /* fetch again */
         zend_hash_get_current_key_ex(keytable, &tablekey, &tablekey_len, &idx, 0, NULL);
-        if(zend_hash_get_current_data(keytable, (void**)&z_value_pp) == FAILURE) {
+        if ((z_value_p = zend_hash_get_current_data(keytable)) == NULL) {
             continue;   /* this should never happen, according to the PHP people. */
         }
 
         /* get current value, a hash value now. */
-        hval = Z_STRVAL_PP(z_value_pp);
+        hval = Z_STRVAL_P(z_value_p);
 
         /* Decode the score depending on flag */
-        if (decode == SCORE_DECODE_INT && Z_STRLEN_PP(z_value_pp) > 0) {
+        if (decode == SCORE_DECODE_INT && Z_STRLEN_P(z_value_p) > 0) {
             add_assoc_long_ex(z_ret, hkey, 1+hkey_len, atoi(hval+1));
         } else if (decode == SCORE_DECODE_DOUBLE) {
             add_assoc_double_ex(z_ret, hkey, 1+hkey_len, atof(hval));
         } else {
             zval *z = NULL;
             MAKE_STD_ZVAL(z);
-            *z = **z_value_pp;
+            *z = *z_value_p;
             zval_copy_ctor(z);
             add_assoc_zval_ex(z_ret, hkey, 1+hkey_len, z);
         }
@@ -1322,11 +1292,7 @@ redis_mbulk_reply_zipped(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         return -1;
     }
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, "read error on connection", 0 TSRMLS_CC);
         return -1;
     }
@@ -1570,17 +1536,11 @@ redis_sock_create(char *host, int host_len, unsigned short port, double timeout,
     redis_sock->retry_interval = retry_interval * 1000;
     redis_sock->persistent = persistent;
     redis_sock->lazy_connect = lazy_connect;
+    redis_sock->persistent_id = NULL;
 
     if(persistent_id) {
-        size_t persistent_id_len = strlen(persistent_id);
-        redis_sock->persistent_id = ecalloc(persistent_id_len + 1, 1);
-        memcpy(redis_sock->persistent_id, persistent_id, persistent_id_len);
-    } else {
-        redis_sock->persistent_id = NULL;
+        redis_sock->persistent_id = estrdup(persistent_id);
     }
-
-    memcpy(redis_sock->host, host, host_len);
-    redis_sock->host[host_len] = '\0';
 
     redis_sock->port    = port;
     redis_sock->timeout = timeout;
@@ -1767,6 +1727,7 @@ PHP_REDIS_API void redis_send_discard(INTERNAL_FUNCTION_PARAMETERS,
         efree(response);
         RETURN_TRUE;
     }
+    efree(response);
     RETURN_FALSE;
 }
 
@@ -1818,11 +1779,7 @@ PHP_REDIS_API int redis_sock_read_multibulk_reply(INTERNAL_FUNCTION_PARAMETERS,
         return -1;
     }
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, "read error on connection", 0 
             TSRMLS_CC);
         return -1;
@@ -1869,11 +1826,7 @@ PHP_REDIS_API int redis_mbulk_reply_raw(INTERNAL_FUNCTION_PARAMETERS, RedisSock 
         return -1;
     }
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, "read error on connection", 0 TSRMLS_CC);
         return -1;
     }
@@ -1956,11 +1909,7 @@ PHP_REDIS_API int redis_mbulk_reply_assoc(INTERNAL_FUNCTION_PARAMETERS, RedisSoc
         return -1;
     }
     if(php_stream_gets(redis_sock->stream, inbuf, 1024) == NULL) {
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
         zend_throw_exception(redis_exception_ce, "read error on connection", 0 TSRMLS_CC);
         return -1;
     }
@@ -2054,7 +2003,7 @@ redis_serialize(RedisSock *redis_sock, zval *z, char **val, int *val_len
 #else
     HashTable ht;
 #endif
-    smart_str sstr = {0};
+    smart_string sstr = {0};
     zval *z_copy;
 #ifdef HAVE_REDIS_IGBINARY
     size_t sz;
@@ -2200,7 +2149,6 @@ redis_unserialize(RedisSock* redis_sock, const char *val, int val_len,
             if (rv_free==1) efree(*return_value);
 #endif
             return 0;
-            break;
     }
     return 0;
 }
@@ -2241,11 +2189,7 @@ redis_sock_gets(RedisSock *redis_sock, char *buf, int buf_size,
                            == NULL) 
     {
         // Close, put our socket state into error
-        redis_stream_close(redis_sock TSRMLS_CC);
-        redis_sock->stream = NULL;
-        redis_sock->status = REDIS_SOCK_STATUS_FAILED;
-        redis_sock->mode = ATOMIC;
-        redis_sock->watching = 0;
+        REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock);
 
         // Throw a read error exception
         zend_throw_exception(redis_exception_ce, "read error on connection", 
@@ -2454,6 +2398,8 @@ redis_read_variant_reply(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
             break;
         default:
             // Protocol error
+            zval_dtor(z_ret);
+            efree(z_ret);
             zend_throw_exception_ex(redis_exception_ce, 0 TSRMLS_CC, 
                 "protocol error, got '%c' as reply-type byte\n", reply_type);
             return FAILURE;
@@ -2473,4 +2419,4 @@ redis_read_variant_reply(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 	return 0;
 }
 
-/* vim: set tabstop=4 softtabstop=4 noexpandtab shiftwidth=4: */
+/* vim: set tabstop=4 softtabstop=4 expandtab shiftwidth=4: */

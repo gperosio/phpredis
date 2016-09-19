@@ -43,7 +43,7 @@ int redis_empty_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
  * the command) we take the start of our array and count */
 int redis_build_raw_cmd(zval **z_args, int argc, char **cmd, int *cmd_len TSRMLS_DC)
 {
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int i;
 
     /* Make sure our first argument is a string */
@@ -221,6 +221,8 @@ int redis_key_str_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
     // Set slot if directed
     CMD_SET_SLOT(slot,key,key_len);
+
+    if (key_free) efree(key);
 
     return SUCCESS;
 }
@@ -428,7 +430,7 @@ int redis_fmt_scan_cmd(char **cmd, REDIS_SCAN_TYPE type, char *key, int key_len,
 {
     static char *kw[] = {"SCAN","SSCAN","HSCAN","ZSCAN"};
     int argc;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
 
     // Figure out our argument count
     argc = 1 + (type!=TYPE_SCAN) + (pat_len>0?2:0) + (count>0?2:0);
@@ -500,6 +502,25 @@ int redis_zrange_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 #define IS_LIMIT_ARG(s, l) \
     (l == sizeof("limit") && !strncasecmp(s,"limit",sizeof("limit")))
 
+/* Helper to get the long value stored in a zval, whether it's actually stored
+ * as a long or is a string that contains a long */
+static int zval_get_long(zval *zv, long *lval)
+{
+    /* If it's already a long, just set and return success */
+    if (Z_TYPE_P(zv) == IS_LONG) {
+        *lval = Z_LVAL_P(zv);
+        return SUCCESS;
+    }
+
+    /* If our zval isn't a string, or doesn't translate into a long, fail */
+    if (Z_TYPE_P(zv) != IS_STRING || is_numeric_string(Z_STRVAL_P(zv), Z_STRLEN_P(zv), lval, NULL, 0) != IS_LONG) {
+        return FAILURE;
+    }
+
+    /* Success */
+    return SUCCESS;
+}
+
 int redis_zrangebyscore_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                             char *kw, char **cmd, int *cmd_len, int *withscores,
                             short *slot, void **ctx)
@@ -509,8 +530,8 @@ int redis_zrangebyscore_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     char *start, *end, *optkey;
     int start_len, end_len;
     int has_limit=0, type;
-    long limit_low, limit_high;
-    zval *z_opt=NULL, **z_ele;
+    long offset, count;
+    zval *z_opt=NULL, *z_ele;
     unsigned long idx;
     unsigned int optlen;
     HashTable *ht_opt;
@@ -531,26 +552,32 @@ int redis_zrangebyscore_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         {
            /* Grab current key and value */
            type = zend_hash_get_current_key_ex(ht_opt, &optkey, &optlen, &idx, 0, NULL);
-           zend_hash_get_current_data(ht_opt, (void**)&z_ele);
+            if ((z_ele = zend_hash_get_current_data(ht_opt)) == NULL) {
+                continue;
+            }
 
            /* All options require a string key type */
            if (type != HASH_KEY_IS_STRING) continue;
 
            /* Check for withscores and limit */
            if (IS_WITHSCORES_ARG(optkey, optlen)) {
-               *withscores = Z_TYPE_PP(z_ele)==IS_BOOL && Z_BVAL_PP(z_ele)==1;
-           } else if(IS_LIMIT_ARG(optkey, optlen) &&
-                     Z_TYPE_PP(z_ele) == IS_ARRAY)
-           {
-                HashTable *htlimit = Z_ARRVAL_PP(z_ele);
+               *withscores = (Z_TYPE_P(z_ele) == IS_BOOL && Z_BVAL_P(z_ele) == 1);
+           } else if (IS_LIMIT_ARG(optkey, optlen) && Z_TYPE_P(z_ele) == IS_ARRAY) {
+                HashTable *htlimit = Z_ARRVAL_P(z_ele);
                 zval **zoff, **zcnt;
+
+                /* We need two arguments (offset and count) */
                 if (zend_hash_index_find(htlimit,0,(void**)&zoff)==SUCCESS &&
-                    zend_hash_index_find(htlimit,1,(void**)&zcnt)==SUCCESS &&
-                    Z_TYPE_PP(zoff) == IS_LONG && Z_TYPE_PP(zcnt) == IS_LONG)
+                    zend_hash_index_find(htlimit,1,(void**)&zcnt)==SUCCESS)
                 {
-                    has_limit = 1;
-                    limit_low = Z_LVAL_PP(zoff);
-                    limit_high = Z_LVAL_PP(zcnt);
+                    /* Set our limit if we can get valid longs from both args */
+                    has_limit = zval_get_long(*zoff, &offset) == SUCCESS &&
+                                zval_get_long(*zcnt, &count) == SUCCESS;
+
+                    /* Inform the user there is a problem if we don't have a limit */
+                    if (!has_limit) {
+                        php_error_docref(NULL TSRMLS_CC, E_WARNING, "Offset and limit must be long values.  Ignoring.");
+                    }
                 }
            }
         }
@@ -564,8 +591,8 @@ int redis_zrangebyscore_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     if(*withscores) {
         if(has_limit) {
             *cmd_len = redis_cmd_format_static(cmd, kw, "ssssdds", key, key_len,
-                start, start_len, end, end_len, "LIMIT", 5, limit_low,
-                limit_high, "WITHSCORES", 10);
+                start, start_len, end, end_len, "LIMIT", 5, offset,
+                count, "WITHSCORES", 10);
         } else {
             *cmd_len = redis_cmd_format_static(cmd, kw, "ssss", key, key_len,
                 start, start_len, end, end_len, "WITHSCORES", 10);
@@ -573,8 +600,7 @@ int redis_zrangebyscore_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     } else {
         if(has_limit) {
             *cmd_len = redis_cmd_format_static(cmd, kw, "ssssdd", key, key_len,
-                start, start_len, end, end_len, "LIMIT", 5, limit_low,
-                limit_high);
+                start, start_len, end, end_len, "LIMIT", 5, offset, count);
         } else {
             *cmd_len = redis_cmd_format_static(cmd, kw, "sss", key, key_len,
                 start, start_len, end, end_len);
@@ -594,10 +620,9 @@ int redis_zinter_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 {
     char *key, *agg_op=NULL;
     int key_free, key_len;
-    zval *z_keys, *z_weights=NULL, **z_ele;
+    zval *z_keys, *z_weights=NULL, *z_ele;
     HashTable *ht_keys, *ht_weights=NULL;
-    HashPosition ptr;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int argc = 2, agg_op_len=0, keys_count;
 
     // Parse args
@@ -659,20 +684,17 @@ int redis_zinter_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     if(key_free) efree(key);
 
     // Process input keys
-    for(zend_hash_internal_pointer_reset_ex(ht_keys, &ptr);
-        zend_hash_get_current_data_ex(ht_keys,(void**)&z_ele,&ptr)==SUCCESS;
-        zend_hash_move_forward_ex(ht_keys, &ptr))
-    {
+    ZEND_HASH_FOREACH_VAL(ht_keys, z_ele) {
         char *key;
         int key_free, key_len;
         zval *z_tmp = NULL;
 
-        if(Z_TYPE_PP(z_ele) == IS_STRING) {
-            key = Z_STRVAL_PP(z_ele);
-            key_len = Z_STRLEN_PP(z_ele);
+        if (Z_TYPE_P(z_ele) == IS_STRING) {
+            key = Z_STRVAL_P(z_ele);
+            key_len = Z_STRLEN_P(z_ele);
         } else {
             MAKE_STD_ZVAL(z_tmp);
-            *z_tmp = **z_ele;
+            *z_tmp = *z_ele;
             convert_to_string(z_tmp);
 
             key = Z_STRVAL_P(z_tmp);
@@ -705,43 +727,39 @@ int redis_zinter_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
             efree(z_tmp);
             z_tmp = NULL;
         }
-    }
+    } ZEND_HASH_FOREACH_END();
 
     // Weights
     if(ht_weights != NULL) {
         redis_cmd_append_sstr(&cmdstr, "WEIGHTS", sizeof("WEIGHTS")-1);
 
         // Process our weights
-        for(zend_hash_internal_pointer_reset_ex(ht_weights,&ptr);
-            zend_hash_get_current_data_ex(ht_weights,(void**)&z_ele,&ptr)
-                                          ==SUCCESS;
-            zend_hash_move_forward_ex(ht_weights,&ptr))
-        {
+        ZEND_HASH_FOREACH_VAL(ht_weights, z_ele) {
             // Ignore non numeric args unless they're inf/-inf
-            if(Z_TYPE_PP(z_ele)!=IS_LONG && Z_TYPE_PP(z_ele)!=IS_DOUBLE &&
-               strncasecmp(Z_STRVAL_PP(z_ele),"inf",sizeof("inf"))!=0 &&
-               strncasecmp(Z_STRVAL_PP(z_ele),"-inf",sizeof("-inf"))!=0 &&
-               strncasecmp(Z_STRVAL_PP(z_ele),"+inf",sizeof("+inf"))!=0)
-            {
+            if (Z_TYPE_P(z_ele) != IS_LONG && Z_TYPE_P(z_ele) != IS_DOUBLE &&
+               strncasecmp(Z_STRVAL_P(z_ele), "inf", sizeof("inf")) != 0 &&
+               strncasecmp(Z_STRVAL_P(z_ele), "-inf", sizeof("-inf")) != 0 &&
+               strncasecmp(Z_STRVAL_P(z_ele), "+inf", sizeof("+inf")) != 0
+            ) {
                 php_error_docref(NULL TSRMLS_CC, E_WARNING,
                     "Weights must be numeric or '-inf','inf','+inf'");
                 efree(cmdstr.c);
                 return FAILURE;
             }
 
-            switch(Z_TYPE_PP(z_ele)) {
+            switch (Z_TYPE_P(z_ele)) {
                 case IS_LONG:
-                    redis_cmd_append_sstr_long(&cmdstr, Z_LVAL_PP(z_ele));
+                    redis_cmd_append_sstr_long(&cmdstr, Z_LVAL_P(z_ele));
                     break;
                 case IS_DOUBLE:
-                    redis_cmd_append_sstr_dbl(&cmdstr, Z_DVAL_PP(z_ele));
+                    redis_cmd_append_sstr_dbl(&cmdstr, Z_DVAL_P(z_ele));
                     break;
                 case IS_STRING:
-                    redis_cmd_append_sstr(&cmdstr, Z_STRVAL_PP(z_ele),
-                        Z_STRLEN_PP(z_ele));
+                    redis_cmd_append_sstr(&cmdstr, Z_STRVAL_P(z_ele),
+                        Z_STRLEN_P(z_ele));
                     break;
             }
-        }
+        } ZEND_HASH_FOREACH_END();
     }
 
     // AGGREGATE
@@ -762,10 +780,9 @@ int redis_subscribe_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                         char *kw, char **cmd, int *cmd_len, short *slot,
                         void **ctx)
 {
-    zval *z_arr, **z_chan;
+    zval *z_arr, *z_chan;
     HashTable *ht_chan;
-    HashPosition ptr;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     subscribeContext *sctx = emalloc(sizeof(subscribeContext));
     int key_len, key_free;
     char *key;
@@ -790,16 +807,13 @@ int redis_subscribe_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     redis_cmd_init_sstr(&cmdstr, sctx->argc, kw, strlen(kw));
 
     // Iterate over channels
-    for(zend_hash_internal_pointer_reset_ex(ht_chan, &ptr);
-        zend_hash_get_current_data_ex(ht_chan, (void**)&z_chan, &ptr)==SUCCESS;
-        zend_hash_move_forward_ex(ht_chan, &ptr))
-    {
+    ZEND_HASH_FOREACH_VAL(ht_chan, z_chan) {
         // We want to deal with strings here
-        convert_to_string(*z_chan);
+        convert_to_string(z_chan);
 
         // Grab channel name, prefix if required
-        key      = Z_STRVAL_PP(z_chan);
-        key_len  = Z_STRLEN_PP(z_chan);
+        key      = Z_STRVAL_P(z_chan);
+        key_len  = Z_STRLEN_P(z_chan);
         key_free = redis_key_prefix(redis_sock, &key, &key_len);
 
         // Add this channel
@@ -807,7 +821,7 @@ int redis_subscribe_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
         // Free our key if it was prefixed
         if(key_free) efree(key);
-    }
+    } ZEND_HASH_FOREACH_END();
 
     // Push values out
     *cmd_len = cmdstr.len;
@@ -825,10 +839,9 @@ int redis_unsubscribe_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                           char *kw, char **cmd, int *cmd_len, short *slot,
                           void **ctx)
 {
-    zval *z_arr, **z_chan;
+    zval *z_arr, *z_chan;
     HashTable *ht_arr;
-    HashPosition ptr;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     subscribeContext *sctx = emalloc(sizeof(subscribeContext));
 
     if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "a", &z_arr)==FAILURE) {
@@ -846,17 +859,14 @@ int redis_unsubscribe_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
     redis_cmd_init_sstr(&cmdstr, sctx->argc, kw, strlen(kw));
 
-    for(zend_hash_internal_pointer_reset_ex(ht_arr, &ptr);
-        zend_hash_get_current_data_ex(ht_arr, (void**)&z_chan, &ptr)==SUCCESS;
-        zend_hash_move_forward_ex(ht_arr, &ptr))
-    {
-        char *key = Z_STRVAL_PP(z_chan);
-        int key_len = Z_STRLEN_PP(z_chan), key_free;
+    ZEND_HASH_FOREACH_VAL(ht_arr, z_chan) {
+        char *key = Z_STRVAL_P(z_chan);
+        int key_len = Z_STRLEN_P(z_chan), key_free;
 
         key_free = redis_key_prefix(redis_sock, &key, &key_len);
         redis_cmd_append_sstr(&cmdstr, key, key_len);
         if(key_free) efree(key);
-    }
+    } ZEND_HASH_FOREACH_END();
 
     // Push out vals
     *cmd_len = cmdstr.len;
@@ -970,7 +980,7 @@ int redis_key_varval_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                          void **ctx)
 {
     zval **z_args;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     char *arg;
     int arg_free, arg_len, i;
     int argc = ZEND_NUM_ARGS();
@@ -1026,10 +1036,9 @@ int redis_key_arr_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                       char *kw, char **cmd, int *cmd_len, short *slot,
                       void **ctx)
 {
-    zval *z_arr, **z_val;
+    zval *z_arr, *z_val;
     HashTable *ht_arr;
-    HashPosition pos;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int key_len, val_len, key_free, val_free, argc = 1;
     char *key, *val;
 
@@ -1052,14 +1061,11 @@ int redis_key_arr_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     if (key_free) efree(key);
 
     /* Iterate our hash table, serializing and appending values */
-    for (zend_hash_internal_pointer_reset_ex(ht_arr, &pos);
-         zend_hash_get_current_data_ex(ht_arr, (void**)&z_val, &pos) == SUCCESS;
-         zend_hash_move_forward_ex(ht_arr, &pos))
-    {
-        val_free = redis_serialize(redis_sock, *z_val, &val, &val_len TSRMLS_CC);
+    ZEND_HASH_FOREACH_VAL(ht_arr, z_val) {
+        val_free = redis_serialize(redis_sock, z_val, &val, &val_len TSRMLS_CC);
         redis_cmd_append_sstr(&cmdstr, val, val_len);
         if (val_free) STR_FREE(val);
-    }
+    } ZEND_HASH_FOREACH_END();
 
     *cmd_len = cmdstr.len;
     *cmd = cmdstr.c;
@@ -1074,12 +1080,12 @@ static int gen_varkey_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                           char *kw, int kw_len, int min_argc, int has_timeout,
                           char **cmd, int *cmd_len, short *slot)
 {
-    zval **z_args, **z_ele;
+    zval **z_args, *z_ele;
     HashTable *ht_arr;
     char *key;
     int key_free, key_len, i, tail;
     int single_array = 0, argc = ZEND_NUM_ARGS();
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     long timeout;
     short kslot = -1;
 
@@ -1121,12 +1127,12 @@ static int gen_varkey_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
     if(single_array) {
         for(zend_hash_internal_pointer_reset(ht_arr);
-            zend_hash_get_current_data(ht_arr,(void**)&z_ele)==SUCCESS;
+            (z_ele = zend_hash_get_current_data(ht_arr)) != NULL;
             zend_hash_move_forward(ht_arr))
         {
-            convert_to_string(*z_ele);
-            key = Z_STRVAL_PP(z_ele);
-            key_len = Z_STRLEN_PP(z_ele);
+            convert_to_string(z_ele);
+            key = Z_STRVAL_P(z_ele);
+            key_len = Z_STRLEN_P(z_ele);
             key_free = redis_key_prefix(redis_sock, &key, &key_len);
 
             // Protect against CROSSLOT errors
@@ -1134,6 +1140,7 @@ static int gen_varkey_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                 if(kslot == -1) {
                     kslot = cluster_hash_key(key, key_len);
                 } else if(cluster_hash_key(key,key_len)!=kslot) {
+                    if(key_free) efree(key);
                     php_error_docref(NULL TSRMLS_CC, E_WARNING,
                         "Not all keys hash to the same slot!");
                     return FAILURE;
@@ -1235,7 +1242,7 @@ int redis_set_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         unsigned int ht_key_len;
         unsigned long idx;
         char *k;
-        zval **v;
+        zval *v;
 
         /* Iterate our option array */
         for(zend_hash_internal_pointer_reset(kt);
@@ -1244,7 +1251,9 @@ int redis_set_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         {
             // Grab key and value
             type = zend_hash_get_current_key_ex(kt, &k, &ht_key_len, &idx, 0, NULL);
-            zend_hash_get_current_data(kt, (void**)&v);
+            if ((v = zend_hash_get_current_data(kt)) == NULL) {
+                continue;
+            }
 
             /* Detect PX or EX argument and validate timeout */
             if (type == HASH_KEY_IS_STRING && IS_EX_PX_ARG(k)) {
@@ -1252,16 +1261,16 @@ int redis_set_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                 exp_type = k;
 
                 /* Try to extract timeout */
-                if (Z_TYPE_PP(v) == IS_LONG) {
-                    expire = Z_LVAL_PP(v);
-                } else if (Z_TYPE_PP(v) == IS_STRING) {
-                    expire = atol(Z_STRVAL_PP(v));
+                if (Z_TYPE_P(v) == IS_LONG) {
+                    expire = Z_LVAL_P(v);
+                } else if (Z_TYPE_P(v) == IS_STRING) {
+                    expire = atol(Z_STRVAL_P(v));
                 }
 
                 /* Expiry can't be set < 1 */
                 if (expire < 1) return FAILURE;
-            } else if (Z_TYPE_PP(v) == IS_STRING && IS_NX_XX_ARG(Z_STRVAL_PP(v))) {
-                set_type = Z_STRVAL_PP(v);
+            } else if (Z_TYPE_P(v) == IS_STRING && IS_NX_XX_ARG(Z_STRVAL_P(v))) {
+                set_type = Z_STRVAL_P(v);
             }
         }
     } else if(z_opts && Z_TYPE_P(z_opts) == IS_LONG) {
@@ -1298,7 +1307,11 @@ int redis_set_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     CMD_SET_SLOT(slot,key,key_len);
 
     if(key_free) efree(key);
+#if PHP_VERSION_ID >= 50400
     if(val_free) str_efree(val);
+#else
+    if(val_free) efree(val);
+#endif
 
     return SUCCESS;
 }
@@ -1484,11 +1497,10 @@ int redis_hmget_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                     char **cmd, int *cmd_len, short *slot, void **ctx)
 {
     char *key;
-    zval *z_arr, **z_mems, **z_mem;
+    zval *z_arr, **z_mems, *z_mem;
     int i, count, valid=0, key_len, key_free;
     HashTable *ht_arr;
-    HashPosition ptr;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
 
     // Parse arguments
     if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa", &key, &key_len,
@@ -1512,24 +1524,21 @@ int redis_hmget_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     z_mems = ecalloc(count+1, sizeof(zval*));
 
     // Iterate over our member array
-    for(zend_hash_internal_pointer_reset_ex(ht_arr, &ptr);
-        zend_hash_get_current_data_ex(ht_arr, (void**)&z_mem, &ptr)==SUCCESS;
-        zend_hash_move_forward_ex(ht_arr, &ptr))
-    {
+    ZEND_HASH_FOREACH_VAL(ht_arr, z_mem) {
         // We can only handle string or long values here
-        if ((Z_TYPE_PP(z_mem)==IS_STRING && Z_STRLEN_PP(z_mem)>0)
-            || Z_TYPE_PP(z_mem)==IS_LONG)
-        {
+        if ((Z_TYPE_P(z_mem) == IS_STRING && Z_STRLEN_P(z_mem) > 0)
+            || Z_TYPE_P(z_mem) == IS_LONG
+        ) {
             // Copy into our member array
             MAKE_STD_ZVAL(z_mems[valid]);
-            *z_mems[valid] = **z_mem;
+            *z_mems[valid] = *z_mem;
             zval_copy_ctor(z_mems[valid]);
             convert_to_string(z_mems[valid]);
 
             // Increment the member count to actually send
             valid++;
         }
-    }
+    } ZEND_HASH_FOREACH_END();
 
     // If nothing was valid, fail
     if(valid == 0) {
@@ -1577,7 +1586,7 @@ int redis_hmset_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     zval *z_arr;
     HashTable *ht_vals;
     HashPosition pos;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
 
     // Parse args
     if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sa", &key, &key_len,
@@ -1688,6 +1697,8 @@ int redis_bitpos_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     // Set our slot
     CMD_SET_SLOT(slot, key, key_len);
 
+    if (key_free) efree(key);
+
     return SUCCESS;
 }
 
@@ -1698,7 +1709,7 @@ int redis_bitop_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     zval **z_args;
     char *key;
     int key_len, i, key_free, argc = ZEND_NUM_ARGS();
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     short kslot;
 
     // Allocate space for args, parse them as an array
@@ -1790,10 +1801,9 @@ static int redis_gen_pf_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                             char *kw, int kw_len, int is_keys, char **cmd,
                             int *cmd_len, short *slot)
 {
-    zval *z_arr, **z_ele;
+    zval *z_arr, *z_ele;
     HashTable *ht_arr;
-    HashPosition pos;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     char *mem, *key;
     int key_len, key_free;
     int mem_len, mem_free, argc=1;
@@ -1826,22 +1836,19 @@ static int redis_gen_pf_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     if(key_free) efree(key);
 
     // Now iterate over the rest of our keys or values
-    for(zend_hash_internal_pointer_reset_ex(ht_arr, &pos);
-        zend_hash_get_current_data_ex(ht_arr, (void**)&z_ele, &pos)==SUCCESS;
-        zend_hash_move_forward_ex(ht_arr, &pos))
-    {
+    ZEND_HASH_FOREACH_VAL(ht_arr, z_ele) {
         zval *z_tmp = NULL;
 
         // Prefix keys, serialize values
         if(is_keys) {
-            if(Z_TYPE_PP(z_ele)!=IS_STRING) {
+            if (Z_TYPE_P(z_ele) != IS_STRING) {
                 MAKE_STD_ZVAL(z_tmp);
-                *z_tmp = **z_ele;
+                *z_tmp = *z_ele;
                 convert_to_string(z_tmp);
-                z_ele = &z_tmp;
+                z_ele = z_tmp;
             }
-            mem = Z_STRVAL_PP(z_ele);
-            mem_len = Z_STRLEN_PP(z_ele);
+            mem = Z_STRVAL_P(z_ele);
+            mem_len = Z_STRLEN_P(z_ele);
 
             // Key prefix
             mem_free = redis_key_prefix(redis_sock, &mem, &mem_len);
@@ -1858,18 +1865,18 @@ static int redis_gen_pf_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                 return FAILURE;
             }
         } else {
-            mem_free = redis_serialize(redis_sock, *z_ele, &mem, &mem_len
+            mem_free = redis_serialize(redis_sock, z_ele, &mem, &mem_len
                 TSRMLS_CC);
 
             if(!mem_free) {
-                if(Z_TYPE_PP(z_ele)!=IS_STRING) {
+                if (Z_TYPE_P(z_ele) != IS_STRING) {
                     MAKE_STD_ZVAL(z_tmp);
-                    *z_tmp = **z_ele;
+                    *z_tmp = *z_ele;
                     convert_to_string(z_tmp);
-                    z_ele = &z_tmp;
+                    z_ele = z_tmp;
                 }
-                mem = Z_STRVAL_PP(z_ele);
-                mem_len = Z_STRLEN_PP(z_ele);
+                mem = Z_STRVAL_P(z_ele);
+                mem_len = Z_STRLEN_P(z_ele);
             }
         }
 
@@ -1892,7 +1899,7 @@ static int redis_gen_pf_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                 efree(mem);
             }
         }
-    }
+    } ZEND_HASH_FOREACH_END();
 
     // Push output arguments
     *cmd = cmdstr.c;
@@ -1921,10 +1928,9 @@ int redis_pfmerge_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 int redis_pfcount_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                       char **cmd, int *cmd_len, short *slot, void **ctx)
 {
-    zval *z_keys, **z_key, *z_tmp = NULL;
+    zval *z_keys, *z_key, *z_tmp = NULL;
     HashTable *ht_keys;
-    HashPosition ptr;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int num_keys, key_len, key_free;
     char *key;
     short kslot=-1;
@@ -1950,22 +1956,19 @@ int redis_pfcount_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         redis_cmd_init_sstr(&cmdstr, num_keys, "PFCOUNT", sizeof("PFCOUNT")-1);
 
         /* Append our key(s) */
-        for (zend_hash_internal_pointer_reset_ex(ht_keys, &ptr);
-             zend_hash_get_current_data_ex(ht_keys, (void**)&z_key, &ptr)==SUCCESS;
-             zend_hash_move_forward_ex(ht_keys, &ptr))
-        {
+        ZEND_HASH_FOREACH_VAL(ht_keys, z_key) {
             /* Turn our value into a string if it isn't one */
-            if (Z_TYPE_PP(z_key) != IS_STRING) {
+            if (Z_TYPE_P(z_key) != IS_STRING) {
                 MAKE_STD_ZVAL(z_tmp);
-                *z_tmp = **z_key;
+                *z_tmp = *z_key;
                 zval_copy_ctor(z_tmp);
                 convert_to_string(z_tmp);
 
                 key = Z_STRVAL_P(z_tmp);
                 key_len = Z_STRLEN_P(z_tmp);
             } else {
-                key = Z_STRVAL_PP(z_key);
-                key_len = Z_STRLEN_PP(z_key);
+                key = Z_STRVAL_P(z_key);
+                key_len = Z_STRLEN_P(z_key);
             }
 
             /* Append this key to our command */
@@ -1997,7 +2000,7 @@ int redis_pfcount_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                 efree(z_tmp);
                 z_tmp = NULL;
             }
-        }
+        } ZEND_HASH_FOREACH_END();
     } else {
         /* Turn our key into a string if it's a different type */
         if (Z_TYPE_P(z_keys) != IS_STRING) {
@@ -2342,10 +2345,10 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                    int *using_store, char **cmd, int *cmd_len, short *slot,
                    void **ctx)
 {
-    zval *z_opts=NULL, **z_ele, *z_argv;
+    zval *z_opts=NULL, *z_ele, *z_argv;
     char *key;
     HashTable *ht_opts;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int key_len, key_free;
 
     if(zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|a", &key, &key_len,
@@ -2387,10 +2390,10 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     ht_opts = Z_ARRVAL_P(z_opts);
 
     // Handle BY pattern
-    if((zend_hash_find(ht_opts, "by", sizeof("by"), (void**)&z_ele)==SUCCESS ||
-       zend_hash_find(ht_opts, "BY", sizeof("BY"), (void**)&z_ele)==SUCCESS) &&
-       Z_TYPE_PP(z_ele)==IS_STRING)
-    {
+    if (((z_ele = zend_hash_str_find(ht_opts, "by", sizeof("by") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "BY", sizeof("BY") - 1)) != NULL
+        ) && Z_TYPE_P(z_ele) == IS_STRING
+    ) {
         // "BY" option is disabled in cluster
         if(slot) {
             php_error_docref(NULL TSRMLS_CC, E_WARNING,
@@ -2403,26 +2406,26 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
         // ... BY <pattern>
         add_next_index_stringl(z_argv, "BY", sizeof("BY")-1, 1);
-        add_next_index_stringl(z_argv,Z_STRVAL_PP(z_ele),Z_STRLEN_PP(z_ele),1);
+        add_next_index_stringl(z_argv, Z_STRVAL_P(z_ele), Z_STRLEN_P(z_ele), 1);
     }
 
     // Handle ASC/DESC option
-    if((zend_hash_find(ht_opts,"sort",sizeof("sort"),(void**)&z_ele)==SUCCESS ||
-       zend_hash_find(ht_opts,"SORT",sizeof("SORT"),(void**)&z_ele)==SUCCESS) &&
-       Z_TYPE_PP(z_ele)==IS_STRING)
-    {
+    if (((z_ele = zend_hash_str_find(ht_opts, "sort", sizeof("sort") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "SORT", sizeof("SORT") - 1)) != NULL
+        ) && Z_TYPE_P(z_ele) == IS_STRING
+    ) {
         // 'asc'|'desc'
-        add_next_index_stringl(z_argv,Z_STRVAL_PP(z_ele),Z_STRLEN_PP(z_ele),1);
+        add_next_index_stringl(z_argv, Z_STRVAL_P(z_ele), Z_STRLEN_P(z_ele), 1);
     }
 
     // STORE option
-    if((zend_hash_find(ht_opts,"store",6,(void**)&z_ele)==SUCCESS ||
-        zend_hash_find(ht_opts,"STORE",6,(void**)&z_ele)==SUCCESS) &&
-        Z_TYPE_PP(z_ele)==IS_STRING)
-    {
+    if (((z_ele = zend_hash_str_find(ht_opts, "store", sizeof("store") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "STORE", sizeof("STORE") - 1)) != NULL
+        ) && Z_TYPE_P(z_ele) == IS_STRING
+    ) {
         // Slot verification
         int cross_slot = slot && *slot != cluster_hash_key(
-            Z_STRVAL_PP(z_ele),Z_STRLEN_PP(z_ele));
+            Z_STRVAL_P(z_ele), Z_STRLEN_P(z_ele));
 
         if(cross_slot) {
             php_error_docref(0 TSRMLS_CC, E_WARNING,
@@ -2435,17 +2438,17 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
         // STORE <key>
         add_next_index_stringl(z_argv,"STORE",sizeof("STORE")-1, 1);
-        add_next_index_stringl(z_argv,Z_STRVAL_PP(z_ele),Z_STRLEN_PP(z_ele),1);
+        add_next_index_stringl(z_argv, Z_STRVAL_P(z_ele), Z_STRLEN_P(z_ele), 1);
 
         // We are using STORE
         *using_store = 1;
     }
 
     // GET option
-    if((zend_hash_find(ht_opts,"get",4,(void**)&z_ele)==SUCCESS ||
-        zend_hash_find(ht_opts,"GET",4,(void**)&z_ele)==SUCCESS) &&
-        (Z_TYPE_PP(z_ele)==IS_STRING || Z_TYPE_PP(z_ele)==IS_ARRAY))
-    {
+    if (((z_ele = zend_hash_str_find(ht_opts, "get", sizeof("get") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "GET", sizeof("GET") - 1)) != NULL
+        ) && (Z_TYPE_P(z_ele) == IS_STRING || Z_TYPE_P(z_ele) == IS_ARRAY)
+    ) {
         // Disabled in cluster
         if(slot) {
             php_error_docref(NULL TSRMLS_CC, E_WARNING,
@@ -2457,32 +2460,30 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
         }
 
         // If it's a string just add it
-        if(Z_TYPE_PP(z_ele)==IS_STRING) {
+        if (Z_TYPE_P(z_ele) == IS_STRING) {
             add_next_index_stringl(z_argv,"GET",sizeof("GET")-1,1);
-            add_next_index_stringl(z_argv,Z_STRVAL_PP(z_ele),
-                Z_STRLEN_PP(z_ele), 1);
+            add_next_index_stringl(z_argv,Z_STRVAL_P(z_ele),
+                Z_STRLEN_P(z_ele), 1);
         } else {
-            HashTable *ht_keys = Z_ARRVAL_PP(z_ele);
+            HashTable *ht_keys = Z_ARRVAL_P(z_ele);
             int added=0;
 
             for(zend_hash_internal_pointer_reset(ht_keys);
                 zend_hash_has_more_elements(ht_keys)==SUCCESS;
                 zend_hash_move_forward(ht_keys))
             {
-                zval **z_key;
+                zval *z_key;
 
                 // If we can't get the data, or it's not a string, skip
-                if(zend_hash_get_current_data(ht_keys,(void**)&z_key)==FAILURE)
+                if ((z_key = zend_hash_get_current_data(ht_keys)) == NULL || Z_TYPE_P(z_key) != IS_STRING) {
                     continue;
-                if(Z_TYPE_PP(z_key)!=IS_STRING)
-                    continue;
-
+                }
                 /* Add get per thing we're getting */
                 add_next_index_stringl(z_argv, "GET", sizeof("GET")-1, 1);
 
                 // Add this key to our argv array
-                add_next_index_stringl(z_argv, Z_STRVAL_PP(z_key),
-                    Z_STRLEN_PP(z_key), 1);
+                add_next_index_stringl(z_argv, Z_STRVAL_P(z_key),
+                    Z_STRLEN_P(z_key), 1);
                 added++;
             }
 
@@ -2499,19 +2500,19 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     }
 
     // ALPHA
-    if((zend_hash_find(ht_opts,"alpha",6,(void**)&z_ele)==SUCCESS ||
-        zend_hash_find(ht_opts,"ALPHA",6,(void**)&z_ele)==SUCCESS) &&
-        Z_TYPE_PP(z_ele)==IS_BOOL && Z_BVAL_PP(z_ele)==1)
-    {
+    if (((z_ele = zend_hash_str_find(ht_opts, "alpha", sizeof("alpha") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "ALPHA", sizeof("ALPHA") - 1)) != NULL
+        ) && Z_TYPE_P(z_ele) == IS_BOOL && Z_BVAL_P(z_ele) == 1
+    ) {
         add_next_index_stringl(z_argv, "ALPHA", sizeof("ALPHA")-1,1);
     }
 
     // LIMIT <offset> <count>
-    if((zend_hash_find(ht_opts,"limit",6,(void**)&z_ele)==SUCCESS ||
-        zend_hash_find(ht_opts,"LIMIT",6,(void**)&z_ele)==SUCCESS) &&
-        Z_TYPE_PP(z_ele)==IS_ARRAY)
-    {
-        HashTable *ht_off = Z_ARRVAL_PP(z_ele);
+    if (((z_ele = zend_hash_str_find(ht_opts, "limit", sizeof("limit") - 1)) != NULL ||
+         (z_ele = zend_hash_str_find(ht_opts, "LIMIT", sizeof("LIMIT") - 1)) != NULL
+        ) && Z_TYPE_P(z_ele) == IS_ARRAY
+    ) {
+        HashTable *ht_off = Z_ARRVAL_P(z_ele);
         zval **z_off, **z_cnt;
 
         if(zend_hash_index_find(ht_off, 0, (void**)&z_off)==SUCCESS &&
@@ -2556,15 +2557,15 @@ int redis_sort_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
 
     // Iterate through our arguments
     for(zend_hash_internal_pointer_reset(ht_argv);
-        zend_hash_get_current_data(ht_argv, (void**)&z_ele)==SUCCESS;
+        (z_ele = zend_hash_get_current_data(ht_argv)) != NULL;
         zend_hash_move_forward(ht_argv))
     {
         // Args are strings or longs
-        if(Z_TYPE_PP(z_ele)==IS_STRING) {
-            redis_cmd_append_sstr(&cmdstr,Z_STRVAL_PP(z_ele),
-                Z_STRLEN_PP(z_ele));
+        if (Z_TYPE_P(z_ele) == IS_STRING) {
+            redis_cmd_append_sstr(&cmdstr,Z_STRVAL_P(z_ele),
+                Z_STRLEN_P(z_ele));
         } else {
-            redis_cmd_append_sstr_long(&cmdstr, Z_LVAL_PP(z_ele));
+            redis_cmd_append_sstr_long(&cmdstr, Z_LVAL_P(z_ele));
         }
     }
 
@@ -2586,7 +2587,7 @@ int redis_hdel_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
                    char **cmd, int *cmd_len, short *slot, void **ctx)
 {
     zval **z_args;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     char *arg;
     int arg_free, arg_len, i;
     int argc = ZEND_NUM_ARGS();
@@ -2645,7 +2646,7 @@ int redis_zadd_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     char *key, *val;
     int key_len, key_free, val_len, val_free;
     int argc = ZEND_NUM_ARGS(), i;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
 
     z_args = emalloc(argc * sizeof(zval*));
     if(zend_get_parameters_array(ht, argc, z_args)==FAILURE) {
@@ -2778,7 +2779,7 @@ static void get_georadius_opts(HashTable *ht, int *withcoord, int *withdist,
     unsigned long idx;
     unsigned int optkeylen;
     char *optkey, *optstr;
-    zval **optval;
+    zval *optval;
 
     /* Iterate over our argument array, collating which ones we have */
     for (zend_hash_internal_pointer_reset(ht);
@@ -2787,14 +2788,16 @@ static void get_georadius_opts(HashTable *ht, int *withcoord, int *withdist,
     {
         /* Grab key and value */
         type = zend_hash_get_current_key_ex(ht, &optkey, &optkeylen, &idx, 0, NULL);
-        zend_hash_get_current_data(ht, (void**)&optval);
+        if ((optval = zend_hash_get_current_data(ht)) == NULL) {
+            continue;
+        }
 
         /* If the key is numeric it's a non value option */
         if (type == HASH_KEY_IS_LONG) {
             /* Option needs to be a string */
-            if (Z_TYPE_PP(optval) != IS_STRING) continue;
+            if (Z_TYPE_P(optval) != IS_STRING) continue;
 
-            optstr = Z_STRVAL_PP(optval);
+            optstr = Z_STRVAL_P(optval);
 
             if (!strcasecmp(optstr, "withcoord")) {
                 *withcoord = 1;
@@ -2807,14 +2810,14 @@ static void get_georadius_opts(HashTable *ht, int *withcoord, int *withdist,
             } else if (!strcasecmp(optstr, "desc")) {
                 *sort = SORT_DESC;
             }
-        } else if (!strcasecmp(optkey, "count") && Z_TYPE_PP(optval) == IS_LONG) {
-            *count = Z_LVAL_PP(optval);
+        } else if (!strcasecmp(optkey, "count") && Z_TYPE_P(optval) == IS_LONG) {
+            *count = Z_LVAL_P(optval);
         }
     }
 }
 
 /* Helper to append options to a GEORADIUS or GEORADIUSBYMEMBER command */
-void append_georadius_opts(smart_str *str, int withcoord, int withdist,
+void append_georadius_opts(smart_string *str, int withcoord, int withdist,
                            int withhash, long count, geoSortType sort)
 {
     /* WITHCOORD option */
@@ -2854,7 +2857,7 @@ int redis_georadius_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
     geoSortType sort = SORT_NONE;
     double lng, lat, radius;
     zval *opts = NULL;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
     int argc;
 
     if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sddds|a", &key, &keylen,
@@ -2913,7 +2916,7 @@ int redis_georadiusbymember_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_s
     double radius;
     geoSortType sort = SORT_NONE;
     zval *opts = NULL;
-    smart_str cmdstr = {0};
+    smart_string cmdstr = {0};
 
     if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "ssds|a", &key, &keylen,
                               &mem, &memlen, &radius, &unit, &unitlen, &opts) == FAILURE)
@@ -3074,19 +3077,19 @@ int redis_command_cmd(INTERNAL_FUNCTION_PARAMETERS, RedisSock *redis_sock,
             return FAILURE;
         }
 
-        zval **z_ele;
+        zval *z_ele;
         HashTable *ht_arr = Z_ARRVAL_P(z_arg);
-        smart_str cmdstr = {0};
+        smart_string cmdstr = {0};
 
         redis_cmd_init_sstr(&cmdstr, 1 + arr_len, "COMMAND", sizeof("COMMAND")-1);
         redis_cmd_append_sstr(&cmdstr, "GETKEYS", sizeof("GETKEYS")-1);
 
         for(zend_hash_internal_pointer_reset(ht_arr);
-            zend_hash_get_current_data(ht_arr, (void**)&z_ele)==SUCCESS;
+            (z_ele = zend_hash_get_current_data(ht_arr)) != NULL;
             zend_hash_move_forward(ht_arr))
         {
-            convert_to_string(*z_ele);
-            redis_cmd_append_sstr(&cmdstr, Z_STRVAL_PP(z_ele), Z_STRLEN_PP(z_ele));
+            convert_to_string(z_ele);
+            redis_cmd_append_sstr(&cmdstr, Z_STRVAL_P(z_ele), Z_STRLEN_P(z_ele));
         }
 
         *cmd = cmdstr.c;
@@ -3153,7 +3156,7 @@ void redis_setoption_handler(INTERNAL_FUNCTION_PARAMETERS,
     switch(option) {
         case REDIS_OPT_SERIALIZER:
             val_long = atol(val_str);
-            test_val = val_long == REDIS_SERIALIZER_NONE || val_long == REDIS_SERIALIZER_PHP;            
+            test_val = val_long == REDIS_SERIALIZER_NONE || val_long == REDIS_SERIALIZER_PHP;
 #ifdef HAVE_REDIS_IGBINARY
             test_val = test_val || val_long == REDIS_SERIALIZER_IGBINARY;
 #endif
@@ -3281,4 +3284,4 @@ void redis_unserialize_handler(INTERNAL_FUNCTION_PARAMETERS,
     }
 }
 
-/* vim: set tabstop=4 softtabstops=4 noexpandtab shiftwidth=4: */
+/* vim: set tabstop=4 softtabstop=4 expandtab shiftwidth=4: */

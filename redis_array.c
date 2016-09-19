@@ -135,21 +135,21 @@ void redis_destructor_redis_array(zend_rsrc_list_entry * rsrc TSRMLS_DC)
 PHP_REDIS_API int redis_array_get(zval *id, RedisArray **ra TSRMLS_DC)
 {
 
-    zval **socket;
+    zval *socket;
     int resource_type;
 
-    if (Z_TYPE_P(id) != IS_OBJECT || zend_hash_find(Z_OBJPROP_P(id), "socket",
-                                  sizeof("socket"), (void **) &socket) == FAILURE) {
+    if (Z_TYPE_P(id) != IS_OBJECT || (socket = zend_hash_str_find(Z_OBJPROP_P(id),
+            "socket", sizeof("socket") - 1)) == NULL) {
         return -1;
     }
 
-    *ra = (RedisArray *) zend_list_find(Z_LVAL_PP(socket), &resource_type);
+    *ra = (RedisArray *) zend_list_find(Z_LVAL_P(socket), &resource_type);
 
     if (!*ra || resource_type != le_redis_array) {
             return -1;
     }
 
-    return Z_LVAL_PP(socket);
+    return Z_LVAL_P(socket);
 }
 
 uint32_t rcrc32(const char *s, size_t sz) {
@@ -207,7 +207,7 @@ uint32_t rcrc32(const char *s, size_t sz) {
     Public constructor */
 PHP_METHOD(RedisArray, __construct)
 {
-	zval *z0, *z_fun = NULL, *z_dist = NULL, **zpData, *z_opts = NULL;
+	zval *z0, *z_fun = NULL, *z_dist = NULL, *zpData, *z_opts = NULL;
 	int id;
 	RedisArray *ra = NULL;
 	zend_bool b_index = 0, b_autorehash = 0, b_pconnect = 0;
@@ -222,76 +222,76 @@ PHP_METHOD(RedisArray, __construct)
 
 	/* extract options */
 	if(z_opts) {
-		zval **z_retry_interval_pp;
-		zval **z_connect_timeout_pp;
+		zval *z_retry_interval_p;
+		zval *z_connect_timeout_p;
 
 		hOpts = Z_ARRVAL_P(z_opts);
 
 		/* extract previous ring. */
-		if(FAILURE != zend_hash_find(hOpts, "previous", sizeof("previous"), (void**)&zpData) && Z_TYPE_PP(zpData) == IS_ARRAY
-			&& zend_hash_num_elements(Z_ARRVAL_PP(zpData)) != 0) {
+        if ((zpData = zend_hash_str_find(hOpts, "previous", sizeof("previous") - 1)) != NULL && Z_TYPE_P(zpData) == IS_ARRAY
+            && zend_hash_num_elements(Z_ARRVAL_P(zpData)) != 0
+        ) {
 			/* consider previous array as non-existent if empty. */
-				hPrev = Z_ARRVAL_PP(zpData);
+            hPrev = Z_ARRVAL_P(zpData);
 		}
 
 		/* extract function name. */
-		if(FAILURE != zend_hash_find(hOpts, "function", sizeof("function"), (void**)&zpData)) {
+        if ((zpData = zend_hash_str_find(hOpts, "function", sizeof("function") - 1)) != NULL) {
 			MAKE_STD_ZVAL(z_fun);
-			*z_fun = **zpData;
+			*z_fun = *zpData;
 			zval_copy_ctor(z_fun);
 		}
 
 		/* extract function name. */
-		if(FAILURE != zend_hash_find(hOpts, "distributor", sizeof("distributor"), (void**)&zpData)) {
+        if ((zpData = zend_hash_str_find(hOpts, "distributor", sizeof("distributor") - 1)) != NULL) {
 			MAKE_STD_ZVAL(z_dist);
-			*z_dist = **zpData;
+			*z_dist = *zpData;
 			zval_copy_ctor(z_dist);
 		}
 
 		/* extract index option. */
-		if(FAILURE != zend_hash_find(hOpts, "index", sizeof("index"), (void**)&zpData) && Z_TYPE_PP(zpData) == IS_BOOL) {
-			b_index = Z_BVAL_PP(zpData);
+        if ((zpData = zend_hash_str_find(hOpts, "index", sizeof("index") - 1)) != NULL && Z_TYPE_P(zpData) == IS_BOOL) {
+            b_index = Z_BVAL_P(zpData);
 		}
 
 		/* extract autorehash option. */
-		if(FAILURE != zend_hash_find(hOpts, "autorehash", sizeof("autorehash"), (void**)&zpData) && Z_TYPE_PP(zpData) == IS_BOOL) {
-			b_autorehash = Z_BVAL_PP(zpData);
+        if ((zpData = zend_hash_str_find(hOpts, "autorehash", sizeof("autorehash") - 1)) != NULL && Z_TYPE_P(zpData) == IS_BOOL) {
+            b_autorehash = Z_BVAL_P(zpData);
 		}
 
 		/* pconnect */
-		if(FAILURE != zend_hash_find(hOpts, "pconnect", sizeof("pconnect"), (void**)&zpData) && Z_TYPE_PP(zpData) == IS_BOOL) {
-		    b_pconnect = Z_BVAL_PP(zpData);
+        if ((zpData = zend_hash_str_find(hOpts, "pconnect", sizeof("pconnect") - 1)) != NULL && Z_TYPE_P(zpData) == IS_BOOL) {
+            b_pconnect = Z_BVAL_P(zpData);
 		}
 
 		/* extract retry_interval option. */
-        if (FAILURE != zend_hash_find(hOpts, "retry_interval", sizeof("retry_interval"), (void**)&z_retry_interval_pp)) {
-			if (Z_TYPE_PP(z_retry_interval_pp) == IS_LONG || Z_TYPE_PP(z_retry_interval_pp) == IS_STRING) {
-				if (Z_TYPE_PP(z_retry_interval_pp) == IS_LONG) {
-					l_retry_interval = Z_LVAL_PP(z_retry_interval_pp);
-				}
-				else {
-					l_retry_interval = atol(Z_STRVAL_PP(z_retry_interval_pp));
+        if ((z_retry_interval_p = zend_hash_str_find(hOpts, "retry_interval", sizeof("retry_interval") - 1)) != NULL) {
+            if (Z_TYPE_P(z_retry_interval_p) == IS_LONG || Z_TYPE_P(z_retry_interval_p) == IS_STRING) {
+                if (Z_TYPE_P(z_retry_interval_p) == IS_LONG) {
+                    l_retry_interval = Z_LVAL_P(z_retry_interval_p);
+                } else {
+                    l_retry_interval = atol(Z_STRVAL_P(z_retry_interval_p));
 				}
 			}
 		}
 
 		/* extract lazy connect option. */
-		if(FAILURE != zend_hash_find(hOpts, "lazy_connect", sizeof("lazy_connect"), (void**)&zpData) && Z_TYPE_PP(zpData) == IS_BOOL) {
-			b_lazy_connect = Z_BVAL_PP(zpData);
+        if ((zpData = zend_hash_str_find(hOpts, "lazy_connect", sizeof("lazy_connect") - 1)) != NULL && Z_TYPE_P(zpData) == IS_BOOL) {
+			b_lazy_connect = Z_BVAL_P(zpData);
 		}
 		
 		/* extract connect_timeout option */		
-		if (FAILURE != zend_hash_find(hOpts, "connect_timeout", sizeof("connect_timeout"), (void**)&z_connect_timeout_pp)) {
-			if (Z_TYPE_PP(z_connect_timeout_pp) == IS_DOUBLE || 
-                Z_TYPE_PP(z_connect_timeout_pp) == IS_STRING ||
-                Z_TYPE_PP(z_connect_timeout_pp) == IS_LONG) 
-            {
-				if (Z_TYPE_PP(z_connect_timeout_pp) == IS_DOUBLE) {
-					d_connect_timeout = Z_DVAL_PP(z_connect_timeout_pp);
-				} else if (Z_TYPE_PP(z_connect_timeout_pp) == IS_LONG) {
-                    d_connect_timeout = Z_LVAL_PP(z_connect_timeout_pp);
+        if ((z_connect_timeout_p = zend_hash_str_find(hOpts, "connect_timeout", sizeof("connect_timeout") - 1)) != NULL) {
+            if (Z_TYPE_P(z_connect_timeout_p) == IS_DOUBLE ||
+                Z_TYPE_P(z_connect_timeout_p) == IS_STRING ||
+                Z_TYPE_P(z_connect_timeout_p) == IS_LONG
+            ) {
+                if (Z_TYPE_P(z_connect_timeout_p) == IS_DOUBLE) {
+                    d_connect_timeout = Z_DVAL_P(z_connect_timeout_p);
+                } else if (Z_TYPE_P(z_connect_timeout_p) == IS_LONG) {
+                    d_connect_timeout = Z_LVAL_P(z_connect_timeout_p);
                 } else {
-					d_connect_timeout = atof(Z_STRVAL_PP(z_connect_timeout_pp));
+                    d_connect_timeout = atof(Z_STRVAL_P(z_connect_timeout_p));
 				}
 			}
 		}		
@@ -328,13 +328,12 @@ PHP_METHOD(RedisArray, __construct)
 static void
 ra_forward_call(INTERNAL_FUNCTION_PARAMETERS, RedisArray *ra, const char *cmd, int cmd_len, zval *z_args, zval *z_new_target) {
 
-	zval **zp_tmp, z_tmp;
+	zval *zp_tmp, z_tmp;
 	char *key = NULL; /* set to avoid "unused-but-set-variable" */
 	int key_len;
 	int i;
 	zval *redis_inst;
 	zval z_fun, **z_callargs;
-	HashPosition pointer;
 	HashTable *h_args;
 
 	int argc;
@@ -372,13 +371,10 @@ ra_forward_call(INTERNAL_FUNCTION_PARAMETERS, RedisArray *ra, const char *cmd, i
 	z_callargs = emalloc(argc * sizeof(zval*));
 
 	/* copy args to array */
-	for (i = 0, zend_hash_internal_pointer_reset_ex(h_args, &pointer);
-			zend_hash_get_current_data_ex(h_args, (void**) &zp_tmp,
-				&pointer) == SUCCESS;
-			++i, zend_hash_move_forward_ex(h_args, &pointer)) {
-
-		z_callargs[i] = *zp_tmp;
-	}
+    i = 0;
+    ZEND_HASH_FOREACH_VAL(h_args, zp_tmp) {
+		z_callargs[i++] = zp_tmp;
+    } ZEND_HASH_FOREACH_END();
 
 	/* multi/exec */
 	if(ra->z_multi_exec) {
@@ -840,12 +836,11 @@ PHP_METHOD(RedisArray, select)
 /* MGET will distribute the call to several nodes and regroup the values. */
 PHP_METHOD(RedisArray, mget)
 {
-	zval *object, *z_keys, z_fun, *z_argarray, **data, *z_ret, **z_cur, *z_tmp_array, *z_tmp;
+	zval *object, *z_keys, z_fun, *z_argarray, *data, *z_ret, **z_cur, *z_tmp_array, *z_tmp;
 	int i, j, n;
 	RedisArray *ra;
 	int *pos, argc, *argc_each;
 	HashTable *h_keys;
-	HashPosition pointer;
 	zval **redis_instances, **argv;
 
 	/* Multi/exec support */
@@ -875,17 +870,14 @@ PHP_METHOD(RedisArray, mget)
 	memset(argc_each, 0, ra->count * sizeof(int));
 
 	/* associate each key to a redis node */
-	for (i = 0, zend_hash_internal_pointer_reset_ex(h_keys, &pointer);
-			zend_hash_get_current_data_ex(h_keys, (void**) &data,
-				&pointer) == SUCCESS;
-			zend_hash_move_forward_ex(h_keys, &pointer), ++i)
-	{
+    i = 0;
+    ZEND_HASH_FOREACH_VAL(h_keys, data) {
 	    /* If we need to represent a long key as a string */
 	    unsigned int key_len;
 	    char kbuf[40], *key_lookup;
 
 	    /* phpredis proper can only use string or long keys, so restrict to that here */
-	    if(Z_TYPE_PP(data) != IS_STRING && Z_TYPE_PP(data) != IS_LONG) {
+	    if (Z_TYPE_P(data) != IS_STRING && Z_TYPE_P(data) != IS_LONG) {
 	        php_error_docref(NULL TSRMLS_CC, E_ERROR, "MGET: all keys must be strings or longs");
 	        efree(argv);
 	        efree(pos);
@@ -895,11 +887,11 @@ PHP_METHOD(RedisArray, mget)
 	    }
 
 	    /* Convert to a string for hash lookup if it isn't one */
-	    if(Z_TYPE_PP(data) == IS_STRING) {
-	        key_len = Z_STRLEN_PP(data);
-            key_lookup = Z_STRVAL_PP(data);
+	    if (Z_TYPE_P(data) == IS_STRING) {
+	        key_len = Z_STRLEN_P(data);
+            key_lookup = Z_STRVAL_P(data);
 	    } else {
-	        key_len = snprintf(kbuf, sizeof(kbuf), "%ld", Z_LVAL_PP(data));
+	        key_len = snprintf(kbuf, sizeof(kbuf), "%ld", Z_LVAL_P(data));
 	        key_lookup = (char*)kbuf;
 	    }
 
@@ -907,8 +899,8 @@ PHP_METHOD(RedisArray, mget)
         redis_instances[i] = ra_find_node(ra, key_lookup, key_len, &pos[i] TSRMLS_CC);
 
 		argc_each[pos[i]]++;	/* count number of keys per node */
-		argv[i] = *data;
-	}
+		argv[i++] = data;
+	} ZEND_HASH_FOREACH_END();
 
 	/* prepare return value */
 	array_init(return_value);
@@ -995,7 +987,7 @@ PHP_METHOD(RedisArray, mget)
 /* MSET will distribute the call to several nodes and regroup the values. */
 PHP_METHOD(RedisArray, mset)
 {
-	zval *object, *z_keys, z_fun, *z_argarray, **data, z_ret;
+	zval *object, *z_keys, z_fun, *z_argarray, *data, z_ret;
 	int i, n;
 	RedisArray *ra;
 	int *pos, argc, *argc_each;
@@ -1040,7 +1032,7 @@ PHP_METHOD(RedisArray, mset)
 			zend_hash_move_forward(h_keys), i++)
 	{
 	    /* We have to skip the element if we can't get the array value */
-        if(zend_hash_get_current_data(h_keys, (void**)&data) == FAILURE) {
+        if ((data = zend_hash_get_current_data(h_keys)) == NULL) {
             continue;
         }
 
@@ -1058,7 +1050,7 @@ PHP_METHOD(RedisArray, mset)
 
 		redis_instances[i] = ra_find_node(ra, key, (int)key_len, &pos[i] TSRMLS_CC);
 		argc_each[pos[i]]++;	/* count number of keys per node */
-		argv[i] = *data;
+		argv[i] = data;
 		keys[i] = key;
 		key_lens[i] = (int)key_len;
 	}
@@ -1134,12 +1126,11 @@ PHP_METHOD(RedisArray, mset)
 /* DEL will distribute the call to several nodes and regroup the values. */
 PHP_METHOD(RedisArray, del)
 {
-	zval *object, *z_keys, z_fun, *z_argarray, **data, *z_ret, *z_tmp, **z_args;
+	zval *object, *z_keys, z_fun, *z_argarray, *data, *z_ret, *z_tmp, **z_args;
 	int i, n;
 	RedisArray *ra;
 	int *pos, argc, *argc_each;
 	HashTable *h_keys;
-	HashPosition pointer;
 	zval **redis_instances, *redis_inst, **argv;
 	long total = 0;
 	int free_zkeys = 0;
@@ -1193,21 +1184,18 @@ PHP_METHOD(RedisArray, del)
 	memset(argc_each, 0, ra->count * sizeof(int));
 
 	/* associate each key to a redis node */
-	for (i = 0, zend_hash_internal_pointer_reset_ex(h_keys, &pointer);
-			zend_hash_get_current_data_ex(h_keys, (void**) &data,
-				&pointer) == SUCCESS;
-			zend_hash_move_forward_ex(h_keys, &pointer), ++i) {
-
-		if (Z_TYPE_PP(data) != IS_STRING) {
+    i = 0;
+    ZEND_HASH_FOREACH_VAL(h_keys, data) {
+		if (Z_TYPE_P(data) != IS_STRING) {
 			php_error_docref(NULL TSRMLS_CC, E_ERROR, "DEL: all keys must be string.");
 			efree(pos);
 			RETURN_FALSE;
 		}
 
-		redis_instances[i] = ra_find_node(ra, Z_STRVAL_PP(data), Z_STRLEN_PP(data), &pos[i] TSRMLS_CC);
+		redis_instances[i] = ra_find_node(ra, Z_STRVAL_P(data), Z_STRLEN_P(data), &pos[i] TSRMLS_CC);
 		argc_each[pos[i]]++;	/* count number of keys per node */
-		argv[i] = *data;
-	}
+		argv[i++] = data;
+	} ZEND_HASH_FOREACH_END();
 
 	/* calls */
 	for(n = 0; n < ra->count; ++n) { /* for each node */

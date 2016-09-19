@@ -1,9 +1,77 @@
 #include "php.h"
 #include "php_ini.h"
-#include <ext/standard/php_smart_str.h>
 
 #ifndef REDIS_COMMON_H
 #define REDIS_COMMON_H
+
+#if (PHP_MAJOR_VERSION < 7)
+#include <ext/standard/php_smart_str.h>
+typedef smart_str smart_string;
+#define smart_string_0(x) smart_str_0(x)
+#define smart_string_appendc(dest, c) smart_str_appendc(dest, c)
+#define smart_string_append_long(dest, val) smart_str_append_long(dest, val)
+#define smart_string_appendl(dest, src, len) smart_str_appendl(dest, src, len)
+
+#define ZEND_HASH_FOREACH_VAL(ht, _val) do { \
+    zval **_pData; \
+    HashPosition _hpos; \
+    for (zend_hash_internal_pointer_reset_ex(ht, &_hpos); \
+         zend_hash_get_current_data_ex(ht, (void **) &_pData, &_hpos) == SUCCESS; \
+         zend_hash_move_forward_ex(ht, &_hpos) \
+    ) { _val = *_pData;
+
+#define ZEND_HASH_FOREACH_END() \
+        } \
+    } while(0)
+
+static zend_always_inline zval *
+zend_hash_str_find(const HashTable *ht, const char *key, size_t len)
+{
+    zval **zv;
+
+    if (zend_hash_find(ht, key, len + 1, (void **)&zv) == SUCCESS) {
+        return *zv;
+    }
+    return NULL;
+}
+
+static zend_always_inline void *
+zend_hash_str_find_ptr(const HashTable *ht, const char *str, size_t len)
+{
+    void **ptr;
+
+    if (zend_hash_find(ht, str, len + 1, (void **)&ptr) == SUCCESS) {
+        return *ptr;
+    }
+    return NULL;
+}
+
+#undef zend_hash_get_current_data
+static zend_always_inline zval *
+zend_hash_get_current_data(HashTable *ht)
+{
+    zval **zv;
+
+    if (zend_hash_get_current_data_ex(ht, (void **)&zv, NULL) == SUCCESS) {
+        return *zv;
+    }
+    return NULL;
+}
+
+static zend_always_inline void *
+zend_hash_get_current_data_ptr(HashTable *ht)
+{
+    void **ptr;
+
+    if (zend_hash_get_current_data_ex(ht, (void **)&ptr, NULL) == SUCCESS) {
+        return *ptr;
+    }
+    return NULL;
+}
+
+#else
+#include <ext/standard/php_smart_string.h>
+#endif
 
 /* NULL check so Eclipse doesn't go crazy */
 #ifndef NULL
@@ -97,10 +165,11 @@ typedef enum _PUBSUB_TYPE {
 
 #define IF_MULTI_OR_PIPELINE() if(redis_sock->mode == MULTI || redis_sock->mode == PIPELINE)
 #define IF_PIPELINE() if(redis_sock->mode == PIPELINE)
+#define IF_NOT_PIPELINE() if(redis_sock->mode != PIPELINE)
 #define IF_NOT_MULTI() if(redis_sock->mode != MULTI)
 #define IF_NOT_ATOMIC() if(redis_sock->mode != ATOMIC)
 #define IF_ATOMIC() if(redis_sock->mode == ATOMIC)
-#define ELSE_IF_MULTI() else if(redis_sock->mode == MULTI) { \
+#define ELSE_IF_MULTI() else IF_MULTI() { \
     if(redis_response_enqueued(redis_sock TSRMLS_CC) == 1) { \
         RETURN_ZVAL(getThis(), 1, 0);\
     } else { \
@@ -160,7 +229,7 @@ typedef enum _PUBSUB_TYPE {
 }
 
 #define REDIS_ELSE_IF_MULTI(function, closure_context) \
-    else if(redis_sock->mode == MULTI) { \
+    else IF_MULTI() { \
         if(redis_response_enqueued(redis_sock TSRMLS_CC) == 1) {\
             REDIS_SAVE_CALLBACK(function, closure_context); \
             RETURN_ZVAL(getThis(), 1, 0);\
@@ -176,14 +245,12 @@ typedef enum _PUBSUB_TYPE {
 }
 
 #define REDIS_PROCESS_REQUEST(redis_sock, cmd, cmd_len) \
-    IF_MULTI_OR_ATOMIC() { \
-        SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len); \
-        efree(cmd); \
-    }\
     IF_PIPELINE() { \
         PIPELINE_ENQUEUE_COMMAND(cmd, cmd_len); \
-        efree(cmd); \
-    }
+    } else { \
+        SOCKET_WRITE_COMMAND(redis_sock, cmd, cmd_len); \
+    } \
+    efree(cmd);
 
 #define REDIS_PROCESS_RESPONSE_CLOSURE(function, closure_context) \
     REDIS_ELSE_IF_MULTI(function, closure_context) \
@@ -227,6 +294,13 @@ typedef enum _PUBSUB_TYPE {
         resp_func(INTERNAL_FUNCTION_PARAM_PASSTHRU, redis_sock, NULL, ctx); \
     } \
     REDIS_PROCESS_RESPONSE_CLOSURE(resp_func,ctx);
+
+#define REDIS_STREAM_CLOSE_MARK_FAILED(redis_sock) \
+    redis_stream_close(redis_sock TSRMLS_CC); \
+    redis_sock->stream = NULL; \
+    redis_sock->mode = ATOMIC; \
+    redis_sock->status = REDIS_SOCK_STATUS_FAILED; \
+    redis_sock->watching = 0
 
 /* Extended SET argument detection */
 #define IS_EX_ARG(a) \
