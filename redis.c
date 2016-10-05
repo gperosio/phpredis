@@ -52,6 +52,7 @@ extern int le_redis_array;
 #ifdef PHP_SESSION
 extern ps_module ps_mod_redis;
 extern ps_module ps_mod_redis_cluster;
+extern ps_module ps_mod_dynomite;
 #endif
 
 extern zend_class_entry *redis_array_ce;
@@ -613,10 +614,11 @@ PHP_MINIT_FUNCTION(redis)
     /* Add shared class constants to Redis and RedisCluster objects */
     add_class_constants(redis_ce, 0 TSRMLS_CC);
     add_class_constants(redis_cluster_ce, 1 TSRMLS_CC);
-    
+
 #ifdef PHP_SESSION
     php_session_register_module(&ps_mod_redis);
     php_session_register_module(&ps_mod_redis_cluster);
+    php_session_register_module(&ps_mod_dynomite);
 #endif
 
     return SUCCESS;
